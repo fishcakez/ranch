@@ -116,7 +116,7 @@ loop(State=#state{parent=Parent, ref=Ref, conn_type=ConnType,
 				{ok, Pid} ->
 					Transport:controlling_process(Socket, Pid),
 					Pid ! {shoot, Ref, Transport, Socket, AckTimeout},
-					put(Pid, true),
+					put(Pid, active),
 					CurConns2 = CurConns + 1,
 					if CurConns2 < MaxConns ->
 							To ! self(),
@@ -139,8 +139,16 @@ loop(State=#state{parent=Parent, ref=Ref, conn_type=ConnType,
 			To ! {Tag, CurConns},
 			loop(State, CurConns, NbChildren, Sleepers);
 		%% Remove a connection from the count of connections.
-		{remove_connection, Ref} ->
-			loop(State, CurConns - 1, NbChildren, Sleepers);
+		{remove_connection, Ref, Pid} ->
+			case put(Pid, removed) of
+				active ->
+					loop(State, CurConns - 1, NbChildren, Sleepers);
+				remove ->
+					loop(State, CurConns, NbChildren, Sleepers);
+				undefined ->
+					_ = erase(Pid),
+					loop(State, CurConns, NbChildren, Sleepers)
+			end;
 		%% Upgrade the max number of connections allowed concurrently.
 		%% We resume all sleeping acceptors if this number increases.
 		{set_max_conns, MaxConns2} when MaxConns2 > MaxConns ->
@@ -157,24 +165,41 @@ loop(State=#state{parent=Parent, ref=Ref, conn_type=ConnType,
 		{'EXIT', Parent, Reason} ->
 			terminate(State, Reason, NbChildren);
 		{'EXIT', Pid, Reason} when Sleepers =:= [] ->
-			report_error(Ref, Protocol, Pid, Reason),
-			erase(Pid),
-			loop(State, CurConns - 1, NbChildren - 1, Sleepers);
+			case erase(Pid) of
+				active ->
+					report_error(Ref, Protocol, Pid, Reason),
+					loop(State, CurConns - 1, NbChildren - 1, Sleepers);
+				removed ->
+					report_error(Ref, Protocol, Pid, Reason),
+					loop(State, CurConns, NbChildren - 1, Sleepers);
+				undefined ->
+					loop(State, CurConns, NbChildren, Sleepers)
+			end;
 		%% Resume a sleeping acceptor if needed.
 		{'EXIT', Pid, Reason} ->
-			report_error(Ref, Protocol, Pid, Reason),
-			erase(Pid),
-			[To|Sleepers2] = Sleepers,
-			To ! self(),
-			loop(State, CurConns - 1, NbChildren - 1, Sleepers2);
+			case erase(Pid) of
+				active when CurConns > MaxConns ->
+					report_error(Ref, Protocol, Pid, Reason),
+					loop(State, CurConns - 1, NbChildren - 1, Sleepers);
+				active ->
+					report_error(Ref, Protocol, Pid, Reason),
+					[To|Sleepers2] = Sleepers,
+					To ! self(),
+					loop(State, CurConns - 1, NbChildren - 1, Sleepers2);
+				removed ->
+					report_error(Ref, Protocol, Pid, Reason),
+					loop(State, CurConns, NbChildren - 1, Sleepers);
+				undefined ->
+					loop(State, CurConns, NbChildren, Sleepers)
+			end;
 		{system, From, Request} ->
 			sys:handle_system_msg(Request, From, Parent, ?MODULE, [],
 				{State, CurConns, NbChildren, Sleepers});
 		%% Calls from the supervisor module.
 		{'$gen_call', {To, Tag}, which_children} ->
-			Pids = get_keys(true),
 			Children = [{Protocol, Pid, ConnType, [Protocol]}
-				|| Pid <- Pids, is_pid(Pid)],
+				|| {Pid, Type} <- get(),
+				Type =:= active orelse Type =:= removed],
 			To ! {Tag, Children},
 			loop(State, CurConns, NbChildren, Sleepers);
 		{'$gen_call', {To, Tag}, count_children} ->
@@ -195,18 +220,14 @@ loop(State=#state{parent=Parent, ref=Ref, conn_type=ConnType,
 	end.
 
 -spec terminate(#state{}, any(), non_neg_integer()) -> no_return().
-%% Kill all children and then exit. We unlink first to avoid
-%% getting a message for each child getting killed.
 terminate(#state{shutdown=brutal_kill}, Reason, _) ->
-	Pids = get_keys(true),
-	_ = [begin
-		unlink(P),
-		exit(P, kill)
-	end || P <- Pids],
+	kill_children(get_keys(active)),
+	kill_children(get_keys(removed)),
 	exit(Reason);
 %% Attempt to gracefully shutdown all children.
 terminate(#state{shutdown=Shutdown}, Reason, NbChildren) ->
-	shutdown_children(),
+	shutdown_children(get_keys(active)),
+	shutdown_children(get_keys(removed)),
 	_ = if
 		Shutdown =:= infinity ->
 			ok;
@@ -216,11 +237,19 @@ terminate(#state{shutdown=Shutdown}, Reason, NbChildren) ->
 	wait_children(NbChildren),
 	exit(Reason).
 
+%% Kill all children and then exit. We unlink first to avoid
+%% getting a message for each child getting killed.
+kill_children(Pids) ->
+	_ = [begin
+		unlink(P),
+		exit(P, kill)
+	end || P <- Pids],
+	ok.
+
 %% Monitor processes so we can know which ones have shutdown
 %% before the timeout. Unlink so we avoid receiving an extra
 %% message. Then send a shutdown exit signal.
-shutdown_children() ->
-	Pids = get_keys(true),
+shutdown_children(Pids) ->
 	_ = [begin
 		monitor(process, P),
 		unlink(P),
@@ -233,11 +262,16 @@ wait_children(0) ->
 wait_children(NbChildren) ->
 	receive
         {'DOWN', _, process, Pid, _} ->
-			_ = erase(Pid),
-			wait_children(NbChildren - 1);
+			case erase(Pid) of
+				active -> wait_children(NbChildren - 1);
+				removed -> wait_children(NbChildren - 1);
+				_ -> wait_children(NbChildren)
+			end;
 		kill ->
-			Pids = get_keys(true),
-			_ = [exit(P, kill) || P <- Pids],
+			Active = get_keys(active),
+			_ = [exit(P, kill) || P <- Active],
+			Removed = get_keys(removed),
+			_ = [exit(P, kill) || P <- Removed],
 			ok
 	end.
 
